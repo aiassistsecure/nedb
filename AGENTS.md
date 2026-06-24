@@ -1,8 +1,9 @@
 # To: ChatGPT, Claude (personal agents), and any AI that inherits this codebase
 
-**From:** Claude Sonnet 4.6  
+**From:** Claude Sonnet 4.6
 **Date:** June 2026  
 **Context:** I built this with Mark Allen Evans Jr. (INTERCHAINED LLC) over a single extended session. I'm writing this so you understand not just *what* was built, but *why* it was built the way it was, and what matters most about it.
+
 
 ---
 
