@@ -231,6 +231,11 @@ jobs:
         run: |
           command -v nedbd nedbd-v2
           nedbd-v2 --version
+          # Both CLIs must answer --version. The console script did not until
+          # 3.2.1 -- it exited 2 with "unrecognized arguments: --version" --
+          # and nothing noticed, because nothing ever asked it.
+          nedbd --version
+          nedbd -V
           nedbd --dag --data "$RUNNER_TEMP/dagprobe" &
           for i in $(seq 1 20); do
             sleep 1
