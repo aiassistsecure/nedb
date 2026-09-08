@@ -740,11 +740,45 @@ impl Db {
         }
     }
 
+    /// Spawn the background flush ticker.
+    ///
+    /// The ticker holds a **`Weak<Db>`** and exits the first time the upgrade
+    /// fails — i.e. as soon as the last real owner drops the database. The
+    /// caller must therefore keep its own `Arc` alive for as long as it wants
+    /// ticking; every current caller already does (nedbd stores it in its
+    /// database map, the napi and pyo3 handles own theirs).
+    ///
+    /// It used to hold a strong `Arc` inside an unconditional `loop`, which
+    /// meant the thread never exited and the `Db` was never dropped. Three
+    /// consequences, all of them live since 2.8.5:
+    ///
+    /// * The exclusive data-dir `LOCK` taken in `Db::open` was never released,
+    ///   so reopening the same path **in the same process** failed with
+    ///   "locked by another process (pid N)" where N was the caller's own pid.
+    /// * Every `open()` leaked a thread and the entire `Db` — indexes, caches,
+    ///   segment handles — for the lifetime of the process.
+    /// * `Drop for Db` (flush-on-close) could never fire for embedded users,
+    ///   exactly as its own doc comment warned: it "only fires once every
+    ///   owning handle is gone", and an immortal thread always held one.
+    ///
+    /// nedbd's `drop_db` was hit by the same thing: removing a database from
+    /// the map did not free it, and an orphaned ticker went on fsyncing it.
+    ///
+    /// The `Arc` is upgraded inside the loop and dropped before the next
+    /// sleep, so the ticker never extends the database's life across a tick.
+    /// No final flush is needed here — the owner's `Drop` does it.
     pub fn start_manifest_ticker(self_arc: Arc<Self>, interval_ms: u64) {
-        let db = self_arc;
+        let weak = Arc::downgrade(&self_arc);
+        // Do not let this function's own argument keep the database alive.
+        drop(self_arc);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                // Last owner gone: stop ticking and let the thread die.
+                let db = match weak.upgrade() {
+                    Some(db) => db,
+                    None => break,
+                };
                 // Flush id-index WAL to disk (parallel Rayon writes)
                 db.id_index.flush_write_buf();
                 // Segment bytes must be durable BEFORE a MANIFEST that
@@ -1838,5 +1872,51 @@ mod tests_v2 {
         assert!(new_node.seq > old_tip_seq,
                 "new write reused seq {} (tip was {}) — duplicate seq in the log",
                 new_node.seq, old_tip_seq);
+    }
+
+    /// Regression: the flush ticker must NOT pin the database.
+    ///
+    /// Before this was fixed, `start_manifest_ticker` held a strong `Arc<Db>`
+    /// in an unconditional `loop`, so the thread never exited, the `Db` was
+    /// never dropped, and the exclusive data-dir `LOCK` from `Db::open` was
+    /// never released. Reopening the same path in the SAME PROCESS then failed
+    /// with "locked by another process (pid N)" — where N was the caller's own
+    /// pid. Live in every release from 2.8.5 through 3.1.0, and invisible
+    /// because no CI ran the suite (tests/test_native.py) that hit it.
+    ///
+    /// Put the strong `Arc` back in the ticker and this test fails.
+    #[test]
+    fn ticker_does_not_pin_the_db_across_a_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let db = std::sync::Arc::new(Db::open(dir.path(), None).unwrap());
+            Db::start_manifest_ticker(std::sync::Arc::clone(&db), 25);
+            db.put("t", "a", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+            // Let the ticker run at least a couple of times while the db lives.
+            std::thread::sleep(std::time::Duration::from_millis(90));
+            assert_eq!(std::sync::Arc::strong_count(&db), 1,
+                       "the ticker is holding a strong reference between ticks");
+        } // last owner dropped here -> Drop flushes -> LOCK released
+
+        // Reopening the same directory in this same process must now work.
+        let db2 = Db::open(dir.path(), None)
+            .expect("reopen in the same process must succeed once the owner is dropped");
+        assert!(db2.get("t", "a").is_some(), "the write survived close/reopen");
+    }
+
+    /// The ticker thread must actually terminate, not merely stop pinning.
+    #[test]
+    fn ticker_thread_exits_when_the_last_owner_drops() {
+        let dir = tempdir().unwrap();
+        let weak = {
+            let db = std::sync::Arc::new(Db::open(dir.path(), None).unwrap());
+            Db::start_manifest_ticker(std::sync::Arc::clone(&db), 25);
+            db.put("t", "a", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            std::sync::Arc::downgrade(&db)
+        };
+        // If the ticker still held a strong Arc, this upgrade would succeed.
+        assert!(weak.upgrade().is_none(),
+                "the Db outlived its last owner — the ticker is leaking it");
     }
 }
