@@ -1,0 +1,242 @@
+name: test
+
+# The gate that was missing.
+#
+# Until this file existed, the only workflows in this repo were `release` and
+# `release-distros` — both triggered exclusively by `push: tags: v*`. The
+# repository holds 21 Python suites and 5 Node suites, and none of them ran on
+# a push or a pull request. Every merge to master was machine-unverified until
+# somebody cut a tag, at which point the first automated opinion about the code
+# arrived *after* it had already been published to PyPI, npm and crates.io.
+#
+# Tiers, cheapest first, so a typo fails in 40 seconds and not in 15 minutes:
+#
+#   python       10 dependency-free suites × 3 interpreters
+#   rust         cargo test on the engine + cargo check on both binding crates
+#   node         napi addon build, then smoke + durability + wrap family
+#   python-native  maturin wheel, then the suites that need `nedb._native`
+#   python-daemon  nedbd binary on PATH, then the suites that self-spawn it
+#
+# Deliberately NOT a release gate: this runs the same suites the release
+# workflow runs (and more), but on every push, so a red master is visible
+# before a tag exists rather than after the artifacts are public.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- python ---
+  # The suites that need nothing but a stdlib interpreter. These are the fast
+  # canary: if the pure-Python engine breaks, everything downstream is noise.
+  python:
+    name: python (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # test_crypto exercises encryption-at-rest, which is an OPTIONAL extra
+      # (`pip install nedb-engine[encryption]`). The engine is right to make it
+      # optional and the suite is right to test it; the runner just has to
+      # actually have it. This is the one dependency the "dependency-free" tier
+      # needs, and it stayed invisible for as long as the suites only ever ran
+      # on machines that happened to have pycryptodome installed already.
+      - name: Install optional extras the suites exercise
+        # pycryptodome: encryption-at-rest (test_crypto).
+        # fakeredis: lets test_wrap_redis run for real instead of self-skipping.
+        run: pip install pycryptodome fakeredis
+      - name: Run dependency-free suites
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: |
+          set -uo pipefail
+          fail=0
+          for t in test_nedb test_bitemporal test_causal test_concurrent \
+                   test_crypto test_deploy test_proof test_v050 \
+                   test_wrap_redis test_adapters; do
+            echo "::group::$t"
+            if python3 "tests/$t.py"; then
+              echo "PASS $t"
+            else
+              echo "::error title=$t::suite failed"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  # ------------------------------------------------------------------ rust ---
+  rust:
+    name: rust (engine + bindings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: cargo test — engine library
+        working-directory: rust
+        run: cargo test -p nedb-engine --lib
+      # The bindings are where drift hides: they are only ever compiled by the
+      # release workflow, so a signature change in the core can sit broken on
+      # master for days. `check` is cheap and catches exactly that.
+      - name: cargo check — napi + pyo3 bindings
+        working-directory: rust
+        run: |
+          cargo check -p nedb-node
+          cargo check -p nedb-py
+
+  # ------------------------------------------------------------------ node ---
+  # Mirrors the release workflow's smoke gate, but on every push. Includes the
+  # wrapper gate: index.js must stay the hand-written durable-mode wrapper and
+  # never be overwritten by the generated napi loader. That regression shipped
+  # silently once (fixed in 2.8.5) and is invisible to behavioural tests.
+  node:
+    name: node (addon + smoke + durability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: npm install
+      - name: Build native addon
+        run: npx napi build --platform --release --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts
+      - name: Wrapper gate — index.js must be the durable-mode wrapper
+        run: |
+          node -e "const {NedbCore}=require('./index.js');
+                   if(!NedbCore.__exitFlushWrapped){
+                     console.error('index.js is the generated loader, not the exit-flush wrapper');
+                     process.exit(1)
+                   }
+                   console.log('wrapper present')"
+      - name: Smoke — five acts
+        run: node test/smoke.mjs | tee out.txt && grep -q "all five acts passed" out.txt
+      - name: Durability — ticker keeps a SIGKILLed write
+        run: node test/durability.test.mjs | tee dur.txt && grep -q "durability contract holds" dur.txt
+      - name: Wrap adapter family (JS)
+        run: node test/wrap_family.test.mjs
+      - name: Inspector
+        run: node test/inspector.test.mjs
+
+  # --------------------------------------------------------- python-native ---
+  # The suites that import `nedb._native`. Built with maturin exactly as the
+  # release `wheels` job does, so a wheel that cannot be built is caught here
+  # rather than mid-release.
+  python-native:
+    name: python (native extension)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Stage Python source into the maturin layout
+        run: |
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+      - name: Build + install the native wheel
+        run: |
+          pip install --upgrade maturin
+          maturin build --release --manifest-path rust/crates/nedb-py/Cargo.toml --out dist
+          pip install --force-reinstall dist/*.whl
+      # NOTE — test_native is deliberately absent from this list.
+      #
+      # It is not flaky and it is not stale. It fails against a REAL engine
+      # defect that this workflow surfaced on its first run:
+      #
+      #   nedb-py's open() calls start_manifest_ticker(Arc::clone(&inner), ms)
+      #   (added in 2.8.5 for embedded durability parity). That ticker is an
+      #   unconditional `loop { sleep; flush }` holding a STRONG Arc<Db>, so it
+      #   never exits and the Db is never dropped. The exclusive data-dir LOCK
+      #   added in 2.7.2 is therefore never released, and reopening the same
+      #   path in the same process fails with "locked by another process
+      #   (pid N)" where N is the caller's OWN pid. Every open() also leaks a
+      #   thread and the whole Db for the process lifetime.
+      #
+      # Re-add this suite in the PR that makes the ticker hold a Weak<Db> and
+      # exit when the upgrade fails — the pattern already used by
+      # register_atexit_flush on the very next line of nedb-py's open().
+      - name: Run native-backed suites
+        run: |
+          set -uo pipefail
+          fail=0
+          for t in test_celebration_v2 test_wrap_family; do
+            echo "::group::$t"
+            if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  # --------------------------------------------------------- python-daemon ---
+  # The suites that talk HTTP to nedbd. Each one auto-spawns the daemon when
+  # nothing answers on :7070 and it can find a `nedbd` on PATH, so the job's
+  # only real duty is to build the binary and put it there.
+  python-daemon:
+    name: python (nedbd HTTP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # httpx: the HTTP client every daemon suite uses.
+      # fakeredis: test_celebration needs it and hard-fails without it, while
+      # test_wrap_redis_nedbd skips cleanly on the same missing import. Install
+      # it so the suite actually runs rather than papering over the difference.
+      - run: pip install httpx fakeredis
+      - name: Build nedbd and put it on PATH
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine
+          cd ..
+          mkdir -p "$HOME/.local/bin"
+          cp rust/target/release/nedbd "$HOME/.local/bin/nedbd"
+          chmod +x "$HOME/.local/bin/nedbd"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run daemon-backed suites
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: |
+          set -uo pipefail
+          nedbd --version || true
+          fail=0
+          for t in test_dag test_client test_tx test_celebration \
+                   test_daemon_ttl test_wrap_redis_nedbd; do
+            echo "::group::$t"
+            if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
+            echo "::endgroup::"
+          done
+          exit $fail

@@ -14,6 +14,7 @@ Proves (against the REAL engine, not mocks):
 
 © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import json
+import os
 import sys
 import tempfile
 
@@ -24,19 +25,43 @@ import nedb  # source tree
 # Graft the compiled Rust core from the installed platform wheel onto this
 # source-tree package (the source tree has no _native binary of its own).
 if not nedb.__has_native__:
-    import importlib.util
-    import sys as _sys
-    # ensure the wheel's own package dir resolves its .so by normal import
-    _wheel_dir = "/agent/.local/lib/python3.9/site-packages"
-    if _wheel_dir not in _sys.path:
-        _sys.path.append(_wheel_dir)
-    # Import under a private name so it doesn't shadow the source tree, then
-    # steal its compiled _native extension module object.
-    import importlib
-    _init = importlib.import_module("nedb")  # already the source tree (path[0] wins)
-    # Direct .so import with its real init name:
-    _so_path = "/agent/.local/lib/python3.9/site-packages/nedb/_native.abi3.so"
+    # Locate the compiled extension in whatever site-packages this interpreter
+    # actually has.
+    #
+    # This block used to hardcode /agent/.local/lib/python3.9/site-packages,
+    # an absolute path inside the sandbox that authored it. That made the suite
+    # unrunnable for every other machine — every human contributor and every CI
+    # runner — and nothing caught it, because until the test workflow existed
+    # no suite ran anywhere but the author's box.
+    import glob
     import importlib.machinery
+    import importlib.util
+    import site
+    import sysconfig
+    import sys as _sys
+
+    _roots = []
+    try:
+        _roots += site.getsitepackages()
+    except Exception:
+        pass
+    for _p in (getattr(site, "getusersitepackages", lambda: None)(),
+               sysconfig.get_paths().get("purelib"),
+               sysconfig.get_paths().get("platlib")):
+        if _p:
+            _roots.append(_p)
+
+    _cands = []
+    for _root in dict.fromkeys(_roots):
+        for _pat in ("_native*.so", "_native*.pyd", "_native*.dylib"):
+            _cands += glob.glob(os.path.join(_root, "nedb", _pat))
+
+    if not _cands:
+        print("SKIP test_wrap_family: no compiled nedb._native found in site-packages "
+              "(install the platform wheel: pip install nedb-engine)")
+        raise SystemExit(0)
+
+    _so_path = _cands[0]
     _loader = importlib.machinery.ExtensionFileLoader("_native", _so_path)
     _spec = importlib.util.spec_from_loader("_native", _loader)
     _wheel_native = importlib.util.module_from_spec(_spec)
