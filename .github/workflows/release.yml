@@ -110,8 +110,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  label: linux-x86_64,   mingw: false }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    label: windows-x86_64, mingw: false }
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,   label: linux-x86_64,        mingw: false, manylinux: auto }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc,     label: windows-x86_64,      mingw: false, manylinux: auto }
+          # ARM64 Linux — Graviton, Ampere, and every container on an Apple
+          # Silicon host. Built on a native ARM runner (free for public repos)
+          # rather than cross-compiled, so the toolchain story stays boring.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, label: linux-aarch64,       mingw: false, manylinux: auto }
+          # musl / Alpine. Without these the install SUCCEEDS and then the
+          # import fails, which is the worst shape of failure: it lands after
+          # the user has already decided to try us.
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-musl,  label: linux-x86_64-musl,   mingw: false, manylinux: musllinux_1_2 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, label: linux-aarch64-musl, mingw: false, manylinux: musllinux_1_2 }
           # macOS wheels (arm64 + x86_64) are built by Codemagic on M2 Mac Minis.
           # MinGW/MSYS2 users get the binary via the fat py3-none-any universal wheel.
           # PyPI rejects mingw_x86_64 platform tags so a separate MinGW wheel is omitted.
@@ -140,6 +149,15 @@ jobs:
         if: "!matrix.mingw"
         with:
           targets: ${{ matrix.target }}
+      # ── musl C toolchain ───────────────────────────────────────────────────
+      # Both musl targets are built on a runner of their OWN architecture, so
+      # this is a native musl build, not a cross-compile: musl-gcc from the
+      # distro is the right linker and no sysroot juggling is needed.
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
       # ── nedbd-v2 binary (MSVC build for both — .exe runs in any Windows env) ─
       - name: Build nedbd-v2 (DAG engine binary)
         if: "!matrix.mingw"
@@ -186,7 +204,8 @@ jobs:
           command: build
           working-directory: rust/crates/nedb-py
           args: --release --out ../../../dist
-          manylinux: auto
+          # auto → manylinux for the glibc targets; musllinux_1_2 for Alpine.
+          manylinux: ${{ matrix.manylinux }}
           target: ${{ matrix.target }}
       # ── Build wheel — MSYS2 maturin for MinGW ─────────────────────────────
       # Run maturin with MSYS2 MinGW Python so the wheel gets mingw_x86_64_*
@@ -294,8 +313,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu  }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc    }
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu    }
+          - { os: windows-latest,  target: x86_64-pc-windows-msvc      }
+          # ARM64 Linux on a native ARM runner — Graviton, Ampere, and Linux
+          # containers on Apple Silicon dev machines.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu  }
+          # musl / Alpine, one per architecture. napi's generated loader already
+          # detects musl at runtime (via process.report glibcVersionRuntime) and
+          # picks the -musl addon — it just needs one to exist.
+          - { os: ubuntu-latest,   target: x86_64-unknown-linux-musl   }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           # macOS napi builds handled by Codemagic — uploaded directly to the GitHub release.
     steps:
       - uses: actions/checkout@v4
@@ -306,6 +333,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
       - name: Install @napi-rs/cli
         run: npm install
       - name: Build native addon
@@ -323,16 +355,21 @@ jobs:
           cargo build --release --bin nedbd --package nedb-engine --target ${{ matrix.target }}
           cd ..
           # Stage the binary with the platform-suffixed name the JS shim expects.
-          # Naming matches the .node convention: nedbd-v2-<platform>-<arch>[.exe]
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-            SRC="rust/target/${{ matrix.target }}/release/nedbd"
-            DEST="nedbd-v2-linux-x64"
-          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            SRC="rust/target/${{ matrix.target }}/release/nedbd.exe"
-            DEST="nedbd-v2-win-x64.exe"
-          else
-            echo "Unknown target ${{ matrix.target }}"; exit 1
-          fi
+          # Naming matches the .node convention: nedbd-v2-<platform>-<arch>[-musl][.exe]
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              SRC="rust/target/${{ matrix.target }}/release/nedbd"; DEST="nedbd-v2-linux-x64" ;;
+            aarch64-unknown-linux-gnu)
+              SRC="rust/target/${{ matrix.target }}/release/nedbd"; DEST="nedbd-v2-linux-arm64" ;;
+            x86_64-unknown-linux-musl)
+              SRC="rust/target/${{ matrix.target }}/release/nedbd"; DEST="nedbd-v2-linux-x64-musl" ;;
+            aarch64-unknown-linux-musl)
+              SRC="rust/target/${{ matrix.target }}/release/nedbd"; DEST="nedbd-v2-linux-arm64-musl" ;;
+            x86_64-pc-windows-msvc)
+              SRC="rust/target/${{ matrix.target }}/release/nedbd.exe"; DEST="nedbd-v2-win-x64.exe" ;;
+            *)
+              echo "Unknown target ${{ matrix.target }}"; exit 1 ;;
+          esac
           cp "$SRC" "$DEST"
           chmod +x "$DEST" || true
           echo "Staged nedbd-v2 binary: $(ls -lh $DEST)"
@@ -344,8 +381,11 @@ jobs:
           for f in *.node; do
             [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
           done
-          # Upload platform-suffixed nedbd-v2 binary (linux-x64 or win-x64.exe)
-          for f in nedbd-v2-linux-x64 nedbd-v2-win-x64.exe; do
+          # Upload every platform-suffixed nedbd-v2 binary this job produced.
+          # Globbed rather than enumerated: an enumerated list silently drops a
+          # newly-added platform, which is exactly how the 2.5.x wrapper went
+          # missing from the published package for three releases.
+          for f in nedbd-v2-*; do
             [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
           done
       - uses: actions/upload-artifact@v4
@@ -353,8 +393,7 @@ jobs:
           name: node-${{ matrix.target }}
           path: |
             *.node
-            nedbd-v2-linux-x64
-            nedbd-v2-win-x64.exe
+            nedbd-v2-*
             index.js
             index.d.ts
             native.js
