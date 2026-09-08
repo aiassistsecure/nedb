@@ -302,6 +302,12 @@ class NEDBSurface:
         self._mappings: List[CollectionMapping] = []
         self.shadow_writes: bool = False
         self._backfilled: bool = False
+        # Set BEFORE any branching. _reload() reads this, and the
+        # DagBackend-ImportError fallback below reaches _reload() without
+        # passing through a branch that assigns it — which made wrap_redis()
+        # raise AttributeError on every install lacking the native wheel,
+        # i.e. exactly the universal py3-none-any path.
+        self._nedbd_mode: bool = False
 
         if nedbd_url:
             # Route all NEDB operations to a running nedbd server
