@@ -12,11 +12,20 @@ Connect to any running `nedbd` instance — local or remote — with a clean asy
 
 ---
 
-## ⚠️ Upgrade your server to nedbd 2.8.6
+## ⚠️ Upgrade your server to nedbd 3.2.0
 
-This client talks to `nedbd`, so its durability comes from the server. **2.8.6 fixes three defects in
-2.8.5 and earlier** — a flush that hit a full disk silently discarded acknowledged writes, flush
-failures were unobservable, and `nedb-cli repair` could not actually rebuild a damaged id index.
+This client talks to `nedbd`, so its durability comes from the server. **Upgrade if you are on
+anything earlier than 3.2.0.**
+
+**3.2.0 — the embedded engine was pinning its own data directory.** The background flush ticker held
+a strong reference to the database in a loop that never exited, so the handle was never dropped: the
+exclusive data-dir `LOCK` was never released, reopening the same path in the same process failed with
+"locked by another process" naming your *own* pid, and every open leaked a thread and the whole
+database for the life of the process. Live in **2.8.5 through 3.1.0**.
+
+**2.8.6 fixed three defects in 2.8.5 and earlier** — a flush that hit a full disk silently discarded
+acknowledged writes, flush failures were unobservable, and `nedb-cli repair` could not actually
+rebuild a damaged id index.
 
 If a database ever returned rows and now returns none while `/verify` reports every object healthy,
 that is the lost-id-index symptom and it is recoverable:
@@ -101,7 +110,7 @@ NEDBD_DAG=1 NEDBD_CAST=1 nedbd --data ./data
 
 # Check health
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"2.8.0","service":"nedbd","encrypted":true}
+# {"ok":true,"version":"3.2.0","service":"nedbd","encrypted":true}
 ```
 
 ---

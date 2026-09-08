@@ -16,7 +16,20 @@ nedbd --dag ./data        # DAG engine (v2, content-addressed, recommended)
 
 ---
 
-## ⚠️ New in 2.8.6 — Durability & Recovery (read this if you store anything you care about)
+## ⚠️ New in 3.2.0 — the flush ticker pinned the database
+
+`start_manifest_ticker` held a strong `Arc<Db>` in an unconditional loop, so the thread never
+exited and the `Db` was never dropped. The exclusive data-dir `LOCK` taken in `Db::open` was
+therefore never released: reopening the same path **in the same process** failed with "locked by
+another process (pid N)" where N is the caller's own pid. Every `open()` also leaked a thread and
+the entire `Db`, and `Drop for Db` (flush-on-close) could never fire. The ticker now holds a
+`Weak<Db>` and exits when its last owner drops. **Live in 2.8.5 through 3.1.0 — upgrade.**
+
+New prebuilt targets: **`aarch64-unknown-linux-gnu`** and **musl** (x86_64 + aarch64).
+
+---
+
+## Earlier — 2.8.6 durability & recovery
 
 Three defects found by killing a real engine at every persistence boundary and by filling a real
 filesystem to zero free blocks. All three are fixed. **If you are on 2.8.5 or earlier, upgrade.**

@@ -1894,13 +1894,30 @@ mod tests_v2 {
             db.put("t", "a", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
             // Let the ticker run at least a couple of times while the db lives.
             std::thread::sleep(std::time::Duration::from_millis(90));
-            assert_eq!(std::sync::Arc::strong_count(&db), 1,
-                       "the ticker is holding a strong reference between ticks");
         } // last owner dropped here -> Drop flushes -> LOCK released
 
-        // Reopening the same directory in this same process must now work.
-        let db2 = Db::open(dir.path(), None)
-            .expect("reopen in the same process must succeed once the owner is dropped");
+        // The ticker upgrades its Weak for the duration of a tick, so at any
+        // given instant it may legitimately hold a transient strong reference.
+        // Release is therefore "eventual, within about one interval", not
+        // instantaneous -- poll for it.
+        //
+        // The first version of this test sampled Arc::strong_count once and
+        // asserted it was 1. That passed on an idle machine and failed the
+        // first time it met a loaded CI runner, because the sample landed
+        // mid-tick. A leak still fails this test deterministically: if the
+        // ticker holds a strong Arc forever the LOCK is never released and
+        // the deadline expires.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let db2 = loop {
+            match Db::open(dir.path(), None) {
+                Ok(db) => break db,
+                Err(e) => {
+                    assert!(std::time::Instant::now() < deadline,
+                            "reopen never succeeded -- the ticker is pinning the Db: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        };
         assert!(db2.get("t", "a").is_some(), "the write survived close/reopen");
     }
 
@@ -1915,8 +1932,14 @@ mod tests_v2 {
             std::thread::sleep(std::time::Duration::from_millis(60));
             std::sync::Arc::downgrade(&db)
         };
-        // If the ticker still held a strong Arc, this upgrade would succeed.
-        assert!(weak.upgrade().is_none(),
-                "the Db outlived its last owner — the ticker is leaking it");
+        // Same reasoning as above: a tick in flight holds a real strong
+        // reference for a few microseconds, so this is an eventual property.
+        // A genuine leak never releases and blows the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while weak.upgrade().is_some() {
+            assert!(std::time::Instant::now() < deadline,
+                    "the Db outlived its last owner — the ticker is leaking it");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }
