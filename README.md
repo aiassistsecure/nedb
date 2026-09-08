@@ -204,6 +204,24 @@ pip install nedb-engine      # Python ≥ 3.8 — pure-Python + optional Rust na
 npm install nedb-engine       # Node ≥ 16   — napi-rs prebuilt binaries
 ```
 
+### Prebuilt platforms
+
+Both registries ship prebuilt binaries for:
+
+| Platform | libc | Python wheel | Node addon |
+|---|---|---|---|
+| Linux x86_64 | glibc | ✅ manylinux | ✅ |
+| Linux x86_64 | musl (Alpine) | ✅ musllinux | ✅ |
+| Linux aarch64 (Graviton, Ampere, Apple-Silicon containers) | glibc | ✅ manylinux | ✅ |
+| Linux aarch64 | musl (Alpine) | ✅ musllinux | ✅ |
+| macOS arm64 + x86_64 | — | ✅ | ✅ |
+| Windows x86_64 | MSVC | ✅ | ✅ |
+
+On Python, any platform without a prebuilt wheel still installs: pip falls back
+to the universal `py3-none-any` wheel and you get the pure-Python v1 AOF engine
+(correct, slower, no embedded DAG). On Node there is no such fallback — an
+unlisted platform has no addon.
+
 ---
 
 ## Python — 5-minute tour
