@@ -210,15 +210,36 @@ jobs:
       # test_wrap_redis_nedbd skips cleanly on the same missing import. Install
       # it so the suite actually runs rather than papering over the difference.
       - run: pip install httpx fakeredis
-      - name: Build nedbd and put it on PATH
+      # `nedbd` is the PYTHON console script (nedb.server:main). It parses
+      # --dag and then execs a RUST binary it looks up by the name `nedbd-v2`.
+      # Installing the Rust binary as `nedbd` (the first version of this job)
+      # replaced the console script entirely, so `nedbd --dag` reached the Rust
+      # binary directly -- which has no --dag flag, exits with "unknown
+      # option", and every daemon suite that self-spawns then times out.
+      # Stage them the way a real `pip install nedb-engine` does.
+      - name: Build nedbd-v2 and install the nedbd console script
         run: |
           cd rust
           cargo build --release --bin nedbd --package nedb-engine
           cd ..
           mkdir -p "$HOME/.local/bin"
-          cp rust/target/release/nedbd "$HOME/.local/bin/nedbd"
-          chmod +x "$HOME/.local/bin/nedbd"
+          cp rust/target/release/nedbd "$HOME/.local/bin/nedbd-v2"
+          chmod +x "$HOME/.local/bin/nedbd-v2"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          pip install -e .
+      - name: Confirm the daemon actually starts in --dag mode
+        run: |
+          command -v nedbd nedbd-v2
+          nedbd-v2 --version
+          nedbd --dag --data "$RUNNER_TEMP/dagprobe" &
+          for i in $(seq 1 20); do
+            sleep 1
+            if curl -sf -m 2 http://127.0.0.1:7070/health | tee /tmp/h.json | grep -q '"engine":"dag"'; then
+              echo "daemon up in dag mode: $(cat /tmp/h.json)"; break
+            fi
+            [ "$i" -eq 20 ] && { echo "daemon never came up"; exit 1; }
+          done
+          pkill -x nedbd-v2 || true
       - name: Run daemon-backed suites
         env:
           PYTHONPATH: ${{ github.workspace }}/python
