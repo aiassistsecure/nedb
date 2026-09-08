@@ -812,6 +812,16 @@ def main() -> None:
         prog="nedbd",
         description="NEDB server daemon — serves durable, time-traveling databases over HTTP/JSON.",
     )
+    # Every CLI should answer --version. The Rust daemon (nedbd-v2) has had -V
+    # since it existed; this console script -- the one `pip install nedb-engine`
+    # actually puts on PATH -- did not, so `nedbd --version` exited 2 with
+    # "unrecognized arguments". argparse's version action fires at parse time,
+    # so it also short-circuits before the --dag exec into the Rust binary.
+    parser.add_argument(
+        "-V", "--version", action="version",
+        version=f"nedbd {__version__}",
+        help="Print the version and exit.",
+    )
     parser.add_argument("--host",       default=os.environ.get("NEDBD_HOST",  "127.0.0.1"))
     parser.add_argument("--port",       type=int, default=int(os.environ.get("NEDBD_PORT", "7070")))
     parser.add_argument("--data",       default=os.environ.get("NEDBD_DATA",  "./nedb-data"))
