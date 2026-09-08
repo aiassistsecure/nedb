@@ -345,7 +345,38 @@ jobs:
         # index.js is the hand-written durable-mode wrapper (exit flush). Until 2.8.5 this step
         # clobbered it and the published package shipped the bare loader.
         run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts
-      - name: Wrapper gate — index.js must be the durable-mode wrapper, not the generated loader
+      # ── Wrapper gate, in two parts ────────────────────────────────────────
+      # The bug this guards (shipped silently for three releases before 2.8.5)
+      # is `napi build` overwriting index.js with the generated loader, so the
+      # published package carried no exit-flush wrapper at all.
+      #
+      # Part 1 is a STATIC check and runs on every target, including the ones
+      # whose addon this runner cannot load. Part 2 actually loads the addon
+      # and asserts the wrapper is live, which is only possible where the
+      # target's libc matches the runner's.
+      - name: Wrapper gate (static) — index.js must not be the generated loader
+        shell: bash
+        run: |
+          set -e
+          if ! grep -q "__exitFlushWrapped" index.js; then
+            echo "::error::index.js does not mention __exitFlushWrapped — napi overwrote the durable-mode wrapper with its generated loader"
+            exit 1
+          fi
+          echo "static wrapper gate ok (${{ matrix.target }})"
+      - name: Wrapper gate (runtime) — load the addon and assert the wrapper is active
+        # Skipped for musl targets, and this is not a workaround for a defect.
+        # Every Linux runner GitHub offers is glibc, so a musl-targeted addon
+        # cannot be dlopen'd on the machine that just cross-built it. napi's
+        # generated loader resolves for the RUNNING platform, so on the musl
+        # legs it looks for `nedb-engine-linux-{x64,arm64}-gnu` — a package
+        # that job never built — and dies with MODULE_NOT_FOUND before it can
+        # even reach the wrapper assertion. That is cross-libc building working
+        # as designed, not a broken addon.
+        #
+        # Coverage is not lost: the static gate above runs on every leg, and
+        # x86_64-unknown-linux-gnu runs the full runtime gate plus the smoke
+        # and durability suites against the very same wrapper file.
+        if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: node -e "const {NedbCore}=require('./index.js'); if (!NedbCore.__exitFlushWrapped) { console.error('index.js is not the exit-flush wrapper'); process.exit(1) } console.log('wrapper present')"
       - name: Build nedbd-v2 binary (DAG engine daemon)
