@@ -173,9 +173,16 @@ class TestDagHealth(unittest.TestCase):
         self.assertEqual(body.get("service"), "nedbd")
 
     def test_health_has_version(self):
+        # Assert the SHAPE, not a hardcoded major. This used to require
+        # version.startswith("2."), which meant the suite failed the moment
+        # the engine reached 3.0.0 -- reporting a version bump as an engine
+        # defect. A pinned major here tests the calendar, not the daemon.
         body = self.c.get("/health").json()
         version = body.get("version", "")
-        self.assertTrue(version.startswith("2."), f"expected v2.x, got {version!r}")
+        self.assertRegex(version, r"^\d+\.\d+\.\d+",
+                         f"health must report a semver version, got {version!r}")
+        self.assertEqual(body.get("engine"), "dag",
+                         f"--dag must select the DAG engine, got {body.get('engine')!r}")
 
     def test_health_has_head_field_not_required(self):
         # /health may not include head — just check it doesn't crash
