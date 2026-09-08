@@ -168,28 +168,21 @@ jobs:
           pip install --upgrade maturin
           maturin build --release --manifest-path rust/crates/nedb-py/Cargo.toml --out dist
           pip install --force-reinstall dist/*.whl
-      # NOTE — test_native is deliberately absent from this list.
+      # test_native is back in this list as of the ticker fix.
       #
-      # It is not flaky and it is not stale. It fails against a REAL engine
-      # defect that this workflow surfaced on its first run:
-      #
-      #   nedb-py's open() calls start_manifest_ticker(Arc::clone(&inner), ms)
-      #   (added in 2.8.5 for embedded durability parity). That ticker is an
-      #   unconditional `loop { sleep; flush }` holding a STRONG Arc<Db>, so it
-      #   never exits and the Db is never dropped. The exclusive data-dir LOCK
-      #   added in 2.7.2 is therefore never released, and reopening the same
-      #   path in the same process fails with "locked by another process
-      #   (pid N)" where N is the caller's OWN pid. Every open() also leaks a
-      #   thread and the whole Db for the process lifetime.
-      #
-      # Re-add this suite in the PR that makes the ticker hold a Weak<Db> and
-      # exit when the upgrade fails — the pattern already used by
-      # register_atexit_flush on the very next line of nedb-py's open().
+      # It was dropped when this gate first ran, because it failed against a
+      # real engine defect rather than a test bug: start_manifest_ticker held a
+      # strong Arc<Db> in an unconditional loop, so the Db was never dropped,
+      # the exclusive data-dir LOCK was never released, and reopening the same
+      # path in the same process failed with "locked by another process (pid
+      # N)" where N was the caller's own pid. The ticker now holds a Weak<Db>
+      # and exits when the upgrade fails, so close/reopen works and this suite
+      # is a real gate again.
       - name: Run native-backed suites
         run: |
           set -uo pipefail
           fail=0
-          for t in test_celebration_v2 test_wrap_family; do
+          for t in test_native test_celebration_v2 test_wrap_family; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
             echo "::endgroup::"

@@ -11,7 +11,7 @@ Run:
 Requires: pip install nedb-engine  (v0.7.0+ for full native parity)
 """
 from __future__ import annotations
-import sys, os, shutil, tempfile, time
+import sys, os, gc, shutil, tempfile, time
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
 print()
@@ -240,7 +240,21 @@ try:
     check("MANIFEST written (v2 DAG)", os.path.exists(manifest))
     check("MANIFEST has content",      os.path.exists(manifest) and os.path.getsize(manifest) > 0)
 
-    # Session 2: reopen — replays AOF
+    # Session 2: reopen.
+    #
+    # Close session 1 FIRST. This test predates the exclusive data-dir LOCK
+    # added in 2.7.2 (split-brain guard) and used to open a second handle while
+    # the first was still live — which the engine now correctly refuses, since
+    # a second engine on the same files cannot see this one's writes. Dropping
+    # the Python handle drops the Rust Arc<Db>, which flushes on Drop and
+    # releases the LOCK.
+    #
+    # This only works because the flush ticker holds a Weak<Db>. While it held
+    # a strong Arc, the Db outlived every handle and the LOCK was never
+    # released, so no amount of `del` here would have let the reopen through.
+    del db1
+    gc.collect()
+
     db2 = NedbCore.open(tmp)
     check("reload: verify()",          db2.verify())
     check("reload: head matches",      db2.head() == head1)
