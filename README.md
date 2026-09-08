@@ -26,86 +26,114 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## ⚠️ New in 2.8.6 — Durability & Recovery (read this if you store anything you care about)
+## New in 3.2.0 — wrap the databases you already run
+
+NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
+rip-and-replace. Five adapters, one surface:
+
+```python
+from nedb import wrap_redis, wrap_sqlite, wrap_mysql, wrap_mongo, wrap_postgresql
+
+r = wrap_redis(redis.Redis())        # or wrap_sqlite(sqlite3.connect("app.db")), ...
+r.nedb.register("driver:*", "driver")   # teach NEDB the host's shape
+r.nedb.backfill()                       # import what is already there
+r.nedb.shadow_writes = True             # every future write is chained
+
+r.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))
+
+r.nedb.query('FROM driver WHERE status = "active"')   # NQL over your Redis data
+r.nedb.query('FROM driver AS OF 41')                  # what it looked like at seq 41
+r.nedb.verify()                                       # True — BLAKE2b chain intact
+```
+
+| wrapper | host | shadowing |
+|---|---|---|
+| `wrap_redis` | `redis.Redis` / compatible | automatic — every write command intercepted |
+| `wrap_sqlite` | `sqlite3.Connection` | automatic — `execute()` intercepted post-write |
+| `wrap_mysql` | DB-API 2.0 (mysql-connector, PyMySQL) | explicit `shadow_row()` |
+| `wrap_mongo` | `pymongo.MongoClient` | explicit `shadow_row()` |
+| `wrap_postgresql` | DB-API 2.0 (psycopg2, psycopg 3) | explicit `shadow_row()` |
+
+**NEDB never writes into the host database's namespace.** Shadow data lives only in the NEDB engine.
+
+Three backends behind the same surface, selected by `backend="auto"`: **nedbd over HTTP** (`nedbd_url=`),
+**embedded v2/v3 DAG** (the Rust core, in-process, no server — `dag_path=` for a durable store,
+`dag_tmk=` for AES-256-GCM at rest), or the **v1 in-process AOF** engine as a universal fallback. On the
+DAG backend you also get `tip()`, `tip_collection()`, `since()` (changefeed) and `scan_status()`.
+
+### 🟢 MIT licensed since 3.0.0
+
+No production restriction, no copyleft, no Change Date. Use it in production, embed it commercially,
+ship it closed-source, fork it, sell it. License review is a wall, not a speed bump — that wall is gone.
+
+### Also in 3.2.0
+
+- **A durability defect that pinned every embedded database.** The background flush ticker held a
+  strong `Arc<Db>` in an unconditional loop, so the handle was never dropped: the exclusive data-dir
+  `LOCK` was never released (reopening the same path *in the same process* failed with "locked by
+  another process" naming your own pid), every `open()` leaked a thread and the whole `Db`, and
+  flush-on-close could never fire. The ticker now holds a `Weak<Db>` and exits when its owner does.
+  **Live in 2.8.5 through 3.1.0 — upgrade if you embed the engine.**
+- **`wrap_redis` crashed on any install without the native wheel** — the pure-Python fallback path
+  raised `AttributeError` from inside `wrap_redis()`. Fixed.
+- **Prebuilt binaries for `linux-arm64` and musl/Alpine**, on npm and PyPI. Graviton, Ampere, Linux
+  containers on Apple Silicon, and Alpine images previously installed cleanly and then failed at
+  import.
+- **CI actually runs the test suites.** Until now the only workflows fired on a version tag, so the
+  first automated opinion about a change arrived *after* it was published to three registries. All
+  26 suites now run on every push and pull request. It found four real defects in its first hour,
+  including two of the ones listed above.
+
+---
+
+## Earlier — 2.8.6 durability & recovery
 
 Three defects found by killing a real engine at every persistence boundary and by filling a real
-filesystem to zero free blocks. All three are fixed. **If you are on 2.8.5 or earlier, upgrade.**
+filesystem to zero free blocks. **If you are on 2.8.5 or earlier, upgrade.**
 
-### 1. A failed flush silently discarded acknowledged writes
+**1. A failed flush silently discarded acknowledged writes.** `IdIndex::flush_write_buf` cleared every
+buffered entry regardless of whether its disk write succeeded, so a flush that hit `ENOSPC` threw the
+entry away and no later flush retried it. Reproduced on a full 22 MiB filesystem: 30 rows acknowledged
+by `put() -> Ok`, then `list()` returned 0 after reopen — while `verify()` reported all 30 objects
+healthy. The content-addressed objects were durable; the id-index entries that make them findable were
+gone. An entry now leaves the WAL only when its write actually landed.
 
-`IdIndex::flush_write_buf` cleared every buffered entry regardless of whether its disk write
-succeeded. So a flush that hit `ENOSPC` threw the entry away, and no later flush retried it.
-
-Reproduced on a full 22 MiB filesystem: **30 rows acknowledged by `put() -> Ok`, then `list()`
-returned 0 after reopen — while `verify()` reported all 30 objects healthy.** The content-addressed
-objects were durable; the id-index entries that make them findable were gone.
-
-```
-before:  try_flush_all() -> (no return value)      reopen -> 0 rows, verify() = 30 ok
-after:   try_flush_all() -> Err("id-index leaf rows/buf_25: No space left on device (os error 28)")
-         ...free space, retry -> Ok                reopen -> 30 rows
-```
-
-**Fixed:** an entry leaves the WAL only when its write actually landed. Failures stay buffered and
-retry on the next flush.
-
-### 2. Flush errors were unobservable — new `try_flush_all()`
-
-`flush_all()` returns `()` and logged fsync failures to stderr, so a caller could not tell a durable
-flush from a failed one. Anything that takes a destructive or externally-visible action on the
-strength of a persisted record needs to know.
+**2. Flush errors were unobservable.** `flush_all()` returns `()`, so a caller could not tell a durable
+flush from a failed one.
 
 ```rust
-// Use this when the outcome matters:
-db.try_flush_all()?;      // Result<()> — id-index WAL + segment sync + MANIFEST
-
-// Still available, still logs, nowhere to propagate (ticker / Drop):
-db.flush_all();
+db.try_flush_all()?;      // Result<()> — use this when the outcome matters
+db.flush_all();           // still logs; for ticker / Drop, nowhere to propagate
 ```
 
-Also new: `Db::try_flush_manifest()` and `IdIndex::try_flush_write_buf()`.
+Also added: `Db::try_flush_manifest()` and `IdIndex::try_flush_write_buf()`.
 
-### 3. `repair` could not repair, and `since()` claimed "caught up" while behind
-
-The cold scan rebuilt `seq_index`, per-collection tips, the Merkle head and `MANIFEST` — but **never
-the id index**. A database whose WAL never reached disk came back with every object verifying and
-`list()` empty, and `nedb-cli repair` printed success without fixing it, because
-`start_cold_scan()` is a deliberate no-op on a warm store.
+**3. `repair` could not repair, and `since()` claimed "caught up" while behind.** The cold scan rebuilt
+`seq_index`, per-collection tips, the Merkle head and `MANIFEST` — but never the id index, and
+`start_cold_scan()` is a deliberate no-op on a warm store, so `nedb-cli repair` printed success on
+exactly the database it exists to fix.
 
 ```bash
 nedb-cli repair ./data
 # repaired: 203 id-index entr(ies) rebuilt, 203 node(s) verified, flushed
 ```
 
-```rust
-let restored = db.repair()?;   // rebuild id index from objects; highest seq wins
-```
+Every object carries its own `coll`, `id` and `seq`, so the index is fully derivable — nothing is
+invented. Separately, `since()` set `has_more = hit_limit` alone; on a warm boot the seq index is empty
+*by design*, so `since()` returned zero nodes with `has_more = false` — indistinguishable from
+genuinely up to date, and a consumer following the documented drain loop stopped one call in with every
+record unread. `has_more` is now true whenever the cursor is behind head, and `ScanStatus` gains
+**`seq_index_ready`** — gate replication on that, not on `scan_complete`.
 
-Every object carries its own `coll`, `id` and `seq`, so the id index is fully derivable — a lost WAL
-is recoverable and nothing is invented. `repair()` also recomputes head and tips, so a repaired
-database reopens **warm** instead of coming back up cold with an empty head.
-
-Separately, `since()` set `has_more = hit_limit` alone. On a warm boot the seq index is empty **by
-design** (that is why warm start is O(1)), so every lookup missed and `since()` returned zero nodes
-with `has_more = false` — indistinguishable from genuinely up to date. A consumer following the
-documented drain loop stopped one call in, with every record unread.
-
-**Fixed:** `has_more` is true whenever the cursor is behind the log head. `ScanStatus` gains
-**`seq_index_ready`** — replication consumers should gate on that, not on `scan_complete`, which is
-true on a warm boot precisely because the scan was skipped.
-
-### Known sharp edge (documented, not changed)
-
-`since()`'s cursor is **exclusive** and seqs start at 0, so `since(0, _)` returns `(0, head]` and the
-very first write in a database (seq 0) is unreachable through any cursor value. Ten writes drain as
-nine records. Changing the convention would break existing consumers; a replica seeded from
-`since()` alone starts one record short.
+**Known sharp edge (documented, not changed):** `since()`'s cursor is **exclusive** and seqs start at 0,
+so `since(0, _)` returns `(0, head]` and the very first write (seq 0) is unreachable through any cursor
+value. Ten writes drain as nine records. Changing the convention would break existing consumers.
 
 ---
 
-## NEDB v2.8.0 — Production Stable
+## NEDB v3.2.0 — Production Stable
 
-**Current stable: 2.8.0** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+**Current stable: 3.2.0** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with native addons for **macOS (arm64 + x86_64), Linux (x86_64 + aarch64, glibc + musl) and Windows x86_64** (see [**Releasing**](#releasing) below). All native wheels (Linux + Windows on GitHub Actions; macOS on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
 
 ### New in 2.8.0 — Cast: the database understands English
 
@@ -150,7 +178,7 @@ nedbd --dag --data ./data
 NEDBD_DAG=1 NEDB_TMK=<32-byte-hex> nedbd --data ./data
 
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"2.2.31","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
+# {"ok":true,"version":"3.2.0","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
 
 # Tail the live event stream (new in v2.2.31)
 curl http://127.0.0.1:7070/events
