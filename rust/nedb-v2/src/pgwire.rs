@@ -142,7 +142,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::db::Db;
@@ -2927,6 +2929,7 @@ fn probe_sql(sql: &str, n_params: usize) -> String {
 }
 
 /// Run a portal's statement if it has not run yet, then report its shape.
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_executed(
     portal: &mut Portal,
     db_name: &str,
@@ -2963,12 +2966,14 @@ fn ensure_executed(
 
 // ── connection handling ─────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_exact(sock: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     sock.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_i32(sock: &mut TcpStream) -> std::io::Result<i32> {
     let b = read_exact(sock, 4).await?;
     Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
@@ -2987,6 +2992,7 @@ fn parse_startup_params(body: &[u8]) -> HashMap<String, String> {
 }
 
 /// Serve one client connection to completion.
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: bool) -> std::io::Result<()> {
     // ── startup, including the SSL negotiation clients try first ────────────
     let params = loop {
@@ -4589,6 +4595,7 @@ fn split_statements(sql: &str) -> Vec<String> {
 }
 
 /// Bind and serve the Postgres read endpoint until the process exits.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow::Result<()> {
     // Writes are ON by default — that is the parity position. An operator who
     // wants the "system of proof beside your database" deployment, where this
